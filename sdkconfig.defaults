@@ -1,0 +1,4 @@
+# Many Seeed XIAO ESP32-C6 boards use 2 MB SPI flash (esptool reports 2 MB).
+# Must match PlatformIO board_upload.flash_size or the bootloader reads the wrong
+# layout and the upload fails / the board boot-loops.
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y

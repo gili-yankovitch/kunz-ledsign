@@ -1,0 +1,5 @@
+# ESP-IDF Component Manager manifest for the project's main component (src/).
+# PlatformIO reads this and fetches the managed dependency automatically.
+dependencies:
+  # WS2812/WS2811 RMT driver. >=3.0 provides color_component_format.
+  espressif/led_strip: "^3.0.0"

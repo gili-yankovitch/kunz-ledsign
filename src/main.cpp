@@ -1,40 +1,139 @@
-#include <FastLED.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ArduinoJson.h>
+/// @file    main.cpp
+/// @brief   Interactive LED-sign firmware, ported from the Arduino sketch
+///          (FastLED + WiFi + WebServer + ArduinoJson) to the pure ESP-IDF
+///          framework.
+///
+/// Mapping of the Arduino dependencies onto ESP-IDF:
+///   FastLED      -> led_strip RMT driver + local CRGB/scale8 helpers
+///   WiFi.h       -> esp_wifi station + event handlers
+///   WebServer    -> esp_http_server (httpd)
+///   ArduinoJson  -> cJSON (bundled with ESP-IDF)
+///   Serial       -> ESP_LOG
+///
+/// The 16x96 matrix exposes an HTTP API on port 80:
+///   GET  /        interactive pixel editor
+///   GET  /docs    API documentation
+///   POST /update  replace the whole frame (JSON array of 96x16 hex colors)
+///   POST /text    render centered text
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+#include "cJSON.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "led_strip.h"
+#include "nvs_flash.h"
 
 #include "secrets.h"
 
+static const char *TAG = "ledsign";
+
 #define LED_PIN 2
-#define COLOR_ORDER GRB
-#define CHIPSET WS2811
 #define BRIGHTNESS 64
 
-const uint8_t kMatrixWidth = 16;
-const uint8_t kMatrixHeight = 96;
-const bool kMatrixSerpentineLayout = true;
-const bool kMatrixVertical = false;
+static const uint8_t kMatrixWidth = 16;
+static const uint8_t kMatrixHeight = 96;
+static const bool kMatrixSerpentineLayout = true;
+static const bool kMatrixVertical = false;
 
 #define NUM_LEDS (kMatrixWidth * kMatrixHeight)
-CRGB leds_plus_safety_pixel[NUM_LEDS + 1];
-CRGB *const leds(leds_plus_safety_pixel + 1);
 
-const unsigned long WIFI_CHECK_INTERVAL_MS = 1000;
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
-const unsigned long TEST_PATTERN_STEP_MS = 500;
+// Largest POST body we will buffer. A full /update frame is ~16 KB of JSON;
+// 64 KB leaves generous headroom while still rejecting absurd payloads.
+#define MAX_BODY_LEN (64 * 1024)
 
-WebServer server(80);
+static const unsigned long TEST_PATTERN_STEP_MS = 500;
 
-bool splashActive = false;
-unsigned long lastWifiCheckMs = 0;
-bool lastWifiConnected = false;
-bool serverStarted = false;
+// ---------------------------------------------------------------------------
+// Minimal FastLED-compatible color type + helpers (Arduino-free)
+// ---------------------------------------------------------------------------
 
-void handleUpdate();
-void handleRoot();
-void handleDocs();
-void handleText();
-static void sendError(int code, const char *message);
+// Plain aggregate so it stays trivially copyable (memset/memcpy-safe).
+struct CRGB
+{
+  uint8_t r, g, b;
+};
+
+static const CRGB COLOR_RED = {255, 0, 0};
+static const CRGB COLOR_GREEN = {0, 255, 0};
+static const CRGB COLOR_BLUE = {0, 0, 255};
+
+/// Milliseconds since boot, replacing Arduino's millis().
+static inline unsigned long millis()
+{
+  return static_cast<unsigned long>(esp_timer_get_time() / 1000);
+}
+
+static inline void delay_ms(uint32_t ms)
+{
+  vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+/// FastLED's "fixed" scale8: scale one byte by a second one (0..255).
+static inline uint8_t scale8(uint8_t i, uint8_t scale)
+{
+  return static_cast<uint8_t>((static_cast<uint16_t>(i) * static_cast<uint16_t>(scale + 1)) >> 8);
+}
+
+// Frame buffer. The original kept a "+1" safety pixel so leds[-1] was a legal
+// scratch address; preserved here for behavioral parity.
+static CRGB leds_plus_safety_pixel[NUM_LEDS + 1];
+static CRGB *const leds(leds_plus_safety_pixel + 1);
+
+static led_strip_handle_t strip;
+// Guards the led buffer + strip against concurrent access from the HTTP server
+// task and the WiFi event task. Recursive so show() can be called from within
+// an already-locked critical section.
+static SemaphoreHandle_t ledMutex;
+
+#define LOCK_LEDS() xSemaphoreTakeRecursive(ledMutex, portMAX_DELAY)
+#define UNLOCK_LEDS() xSemaphoreGiveRecursive(ledMutex)
+
+static volatile bool gWifiConnected = false;
+static bool splashActive = false;
+
+/// Push the frame buffer to the strip, applying global brightness
+/// (FastLED.setBrightness equivalent).
+static void show()
+{
+  LOCK_LEDS();
+  for (int i = 0; i < NUM_LEDS; i++)
+  {
+    led_strip_set_pixel(strip, i,
+                        scale8(leds[i].r, BRIGHTNESS),
+                        scale8(leds[i].g, BRIGHTNESS),
+                        scale8(leds[i].b, BRIGHTNESS));
+  }
+  led_strip_refresh(strip);
+  UNLOCK_LEDS();
+}
+
+static void clearLeds()
+{
+  memset(leds, 0, sizeof(CRGB) * NUM_LEDS);
+}
+
+static void fillSolid(CRGB color)
+{
+  for (int i = 0; i < NUM_LEDS; i++)
+    leds[i] = color;
+}
+
+// ---------------------------------------------------------------------------
+// XY mapping (unchanged)
+// ---------------------------------------------------------------------------
 
 uint16_t XY(uint8_t x, uint8_t y)
 {
@@ -82,13 +181,13 @@ uint16_t XY(uint8_t x, uint8_t y)
   return i;
 }
 
-// 5-wide bitmap font for digits and '.'. Each row stored in low 5 bits, MSB = leftmost.
-// Digits are 7 rows tall; the '.' is a compact 2-row dot so a full IP fits along the long axis.
-// Glyphs are drawn rotated 90° clockwise: a tall digit sits across matrix-x and chars stride
-// along matrix-y.
+// ---------------------------------------------------------------------------
+// 5x7 bitmap font, drawn rotated 90 degrees (unchanged from the sketch)
+// ---------------------------------------------------------------------------
+
 constexpr int GLYPH_WIDTH = 5;
 constexpr int GLYPH_SPACING = 1;
-constexpr int DIGIT_HEIGHT = 7; // max glyph height; sets the rotated x-extent
+constexpr int DIGIT_HEIGHT = 7;
 
 struct Glyph
 {
@@ -201,70 +300,39 @@ static int measureString(const char *s)
   return total;
 }
 
+// ---------------------------------------------------------------------------
+// Frame helpers (unchanged logic)
+// ---------------------------------------------------------------------------
+
 static CRGB wifiIndicatorColor()
 {
-  return (WiFi.status() == WL_CONNECTED) ? CRGB::Green : CRGB::Red;
+  return gWifiConnected ? COLOR_GREEN : COLOR_RED;
 }
 
-static void showSplash(const String &ip)
+static void showSplash(const char *ip)
 {
-  FastLED.clear();
-  int totalH = measureString(ip.c_str());
+  LOCK_LEDS();
+  clearLeds();
+  int totalH = measureString(ip);
   int yStart = (kMatrixHeight - totalH) / 2;
   if (yStart < 0) yStart = 0;
   int xStart = (kMatrixWidth - DIGIT_HEIGHT) / 2;
-  drawString(ip.c_str(), xStart, yStart, CRGB::Green);
-  FastLED.show();
+  drawString(ip, xStart, yStart, COLOR_GREEN);
+  show();
+  UNLOCK_LEDS();
 }
 
 static void runStartupTestPattern()
 {
-  const CRGB colors[3] = {CRGB::Red, CRGB::Green, CRGB::Blue};
+  const CRGB colors[3] = {COLOR_RED, COLOR_GREEN, COLOR_BLUE};
   for (int i = 0; i < 3; i++)
   {
-    fill_solid(leds, NUM_LEDS, colors[i]);
-    FastLED.show();
-    delay(TEST_PATTERN_STEP_MS);
+    fillSolid(colors[i]);
+    show();
+    delay_ms(TEST_PATTERN_STEP_MS);
   }
-  FastLED.clear();
-  FastLED.show();
-}
-
-static bool connectWifi(unsigned long timeoutMs)
-{
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("Connecting to WiFi '%s'", WIFI_SSID);
-  unsigned long deadline = millis() + timeoutMs;
-  while (WiFi.status() != WL_CONNECTED && millis() < deadline)
-  {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-  return WiFi.status() == WL_CONNECTED;
-}
-
-static void beginSplash()
-{
-  Serial.print("Connected. IP: ");
-  Serial.println(WiFi.localIP());
-  showSplash(WiFi.localIP().toString());
-  splashActive = true;
-}
-
-static void startServer()
-{
-  if (serverStarted) return;
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/docs", HTTP_GET, handleDocs);
-  server.on("/update", HTTP_POST, handleUpdate);
-  server.on("/text", HTTP_POST, handleText);
-  server.onNotFound([]() { sendError(404, "not found"); });
-  server.begin();
-  serverStarted = true;
-  Serial.println("HTTP server listening on port 80 (GET /, GET /docs, POST /update, POST /text)");
+  clearLeds();
+  show();
 }
 
 static void applyMirror()
@@ -302,19 +370,59 @@ static bool parseHexColor(const char *s, CRGB &out)
   int r = (hexNibble(s[0]) << 4) | hexNibble(s[1]);
   int g = (hexNibble(s[2]) << 4) | hexNibble(s[3]);
   int b = (hexNibble(s[4]) << 4) | hexNibble(s[5]);
-  out = CRGB(r, g, b);
+  out = CRGB{(uint8_t)r, (uint8_t)g, (uint8_t)b};
   return true;
 }
 
-static void sendError(int code, const char *message)
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
+
+static httpd_handle_t httpServer = nullptr;
+
+static esp_err_t sendError(httpd_req_t *req, const char *status, const char *message)
 {
-  String body = "{\"error\":\"";
-  body += message;
-  body += "\"}";
-  server.send(code, "application/json", body);
+  httpd_resp_set_status(req, status);
+  httpd_resp_set_type(req, "application/json");
+  char body[160];
+  snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+  httpd_resp_sendstr(req, body);
+  return ESP_OK;
 }
 
-const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+/// Read the full request body into a heap buffer (caller frees). Returns
+/// nullptr on missing/oversized body or a recv error.
+static char *recvBody(httpd_req_t *req)
+{
+  size_t total = req->content_len;
+  if (total == 0 || total > MAX_BODY_LEN) return nullptr;
+  char *buf = static_cast<char *>(malloc(total + 1));
+  if (buf == nullptr) return nullptr;
+  size_t received = 0;
+  while (received < total)
+  {
+    int r = httpd_req_recv(req, buf + received, total - received);
+    if (r <= 0)
+    {
+      free(buf);
+      return nullptr;
+    }
+    received += r;
+  }
+  buf[total] = '\0';
+  return buf;
+}
+
+static bool queryHasMirror(httpd_req_t *req)
+{
+  char query[64];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+  char val[8];
+  if (httpd_query_key_value(query, "mirror", val, sizeof(val)) != ESP_OK) return false;
+  return strcmp(val, "1") == 0;
+}
+
+static const char INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -517,12 +625,7 @@ txt.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();stampT
 </body>
 </html>)rawliteral";
 
-void handleRoot()
-{
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
-const char DOCS_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+static const char DOCS_HTML[] = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -591,166 +694,291 @@ ul{padding-left:22px}
 </body>
 </html>)rawliteral";
 
-void handleDocs()
+static esp_err_t handleRoot(httpd_req_t *req)
 {
-  server.send_P(200, "text/html", DOCS_HTML);
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
-void handleUpdate()
+static esp_err_t handleDocs(httpd_req_t *req)
 {
-  if (!server.hasArg("plain"))
-  {
-    sendError(400, "missing body");
-    return;
-  }
-  String body = server.arg("plain");
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err)
-  {
-    sendError(400, err.c_str());
-    return;
-  }
-  if (!doc.is<JsonArray>())
-  {
-    sendError(400, "expected top-level array");
-    return;
-  }
-  JsonArray rows = doc.as<JsonArray>();
-  if (rows.size() != kMatrixHeight)
-  {
-    sendError(400, "expected 96 rows");
-    return;
-  }
-
-  CRGB pending[NUM_LEDS];
-
-  for (uint8_t y = 0; y < kMatrixHeight; y++)
-  {
-    JsonVariant rowVar = rows[y];
-    if (!rowVar.is<JsonArray>())
-    {
-      sendError(400, "row is not an array");
-      return;
-    }
-    JsonArray row = rowVar.as<JsonArray>();
-    if (row.size() != kMatrixWidth)
-    {
-      sendError(400, "expected 16 columns per row");
-      return;
-    }
-    for (uint8_t x = 0; x < kMatrixWidth; x++)
-    {
-      const char *hex = row[x].as<const char *>();
-      CRGB color;
-      if (!parseHexColor(hex, color))
-      {
-        sendError(400, "invalid hex color");
-        return;
-      }
-      pending[XY(x, y)] = color;
-    }
-  }
-
-  memcpy(leds, pending, sizeof(pending));
-  if (server.arg("mirror") == "1") applyMirror();
-  splashActive = false;
-  leds[0] = wifiIndicatorColor();
-  FastLED.show();
-  server.send(200, "application/json", "{\"status\":\"ok\"}");
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, DOCS_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
-void handleText()
+// Frame staging buffer. Only ever touched from the single HTTP server task, so
+// it can be static (and kept off the limited handler stack).
+static CRGB pending[NUM_LEDS];
+
+static esp_err_t handleUpdate(httpd_req_t *req)
 {
-  if (!server.hasArg("plain"))
+  char *body = recvBody(req);
+  if (body == nullptr) return sendError(req, "400 Bad Request", "missing or oversized body");
+
+  cJSON *doc = cJSON_Parse(body);
+  free(body);
+  if (doc == nullptr) return sendError(req, "400 Bad Request", "parse error");
+
+  esp_err_t result;
+  if (!cJSON_IsArray(doc))
   {
-    sendError(400, "missing body");
-    return;
+    result = sendError(req, "400 Bad Request", "expected top-level array");
   }
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, server.arg("plain"));
-  if (err)
+  else if (cJSON_GetArraySize(doc) != kMatrixHeight)
   {
-    sendError(400, err.c_str());
-    return;
-  }
-  const char *text = doc["text"].as<const char *>();
-  if (text == nullptr)
-  {
-    sendError(400, "missing 'text'");
-    return;
-  }
-  CRGB color = CRGB::Green;
-  const char *colorStr = doc["color"].as<const char *>();
-  if (colorStr != nullptr && !parseHexColor(colorStr, color))
-  {
-    sendError(400, "invalid color");
-    return;
-  }
-
-  FastLED.clear();
-  int totalH = measureString(text);
-  int yStart = (kMatrixHeight - totalH) / 2;
-  if (yStart < 0) yStart = 0;
-  int xStart = (kMatrixWidth - DIGIT_HEIGHT) / 2;
-  drawString(text, xStart, yStart, color);
-  if (doc["mirror"] | false) applyMirror();
-
-  splashActive = false;
-  leds[0] = wifiIndicatorColor();
-  FastLED.show();
-  server.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-void setup()
-{
-  Serial.begin(115200);
-
-  FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalSMD5050);
-  FastLED.setBrightness(BRIGHTNESS);
-
-  runStartupTestPattern();
-
-  leds[0] = CRGB::Red;
-  FastLED.show();
-  lastWifiConnected = false;
-
-  if (connectWifi(WIFI_CONNECT_TIMEOUT_MS))
-  {
-    lastWifiConnected = true;
-    leds[0] = CRGB::Green;
-    FastLED.show();
-    beginSplash();
-    startServer();
+    result = sendError(req, "400 Bad Request", "expected 96 rows");
   }
   else
   {
-    Serial.println("WiFi connect timed out; staying red and will keep retrying.");
+    bool ok = true;
+    const char *errMsg = nullptr;
+    for (uint8_t y = 0; y < kMatrixHeight && ok; y++)
+    {
+      cJSON *row = cJSON_GetArrayItem(doc, y);
+      if (!cJSON_IsArray(row))
+      {
+        ok = false;
+        errMsg = "row is not an array";
+        break;
+      }
+      if (cJSON_GetArraySize(row) != kMatrixWidth)
+      {
+        ok = false;
+        errMsg = "expected 16 columns per row";
+        break;
+      }
+      for (uint8_t x = 0; x < kMatrixWidth; x++)
+      {
+        const char *hex = cJSON_GetStringValue(cJSON_GetArrayItem(row, x));
+        CRGB color;
+        if (!parseHexColor(hex, color))
+        {
+          ok = false;
+          errMsg = "invalid hex color";
+          break;
+        }
+        pending[XY(x, y)] = color;
+      }
+    }
+
+    if (!ok)
+    {
+      result = sendError(req, "400 Bad Request", errMsg);
+    }
+    else
+    {
+      LOCK_LEDS();
+      memcpy(leds, pending, sizeof(pending));
+      if (queryHasMirror(req)) applyMirror();
+      splashActive = false;
+      leds[0] = wifiIndicatorColor();
+      show();
+      UNLOCK_LEDS();
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+      result = ESP_OK;
+    }
   }
-  lastWifiCheckMs = millis();
+
+  cJSON_Delete(doc);
+  return result;
 }
 
-void loop()
+static esp_err_t handleText(httpd_req_t *req)
 {
-  if (serverStarted) server.handleClient();
+  char *body = recvBody(req);
+  if (body == nullptr) return sendError(req, "400 Bad Request", "missing or oversized body");
 
-  unsigned long now = millis();
+  cJSON *doc = cJSON_Parse(body);
+  free(body);
+  if (doc == nullptr) return sendError(req, "400 Bad Request", "parse error");
 
-  if (!splashActive && now - lastWifiCheckMs >= WIFI_CHECK_INTERVAL_MS)
+  esp_err_t result;
+  const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(doc, "text"));
+  if (text == nullptr)
   {
-    lastWifiCheckMs = now;
-    bool connected = (WiFi.status() == WL_CONNECTED);
-    if (connected != lastWifiConnected)
+    result = sendError(req, "400 Bad Request", "missing 'text'");
+  }
+  else
+  {
+    CRGB color = COLOR_GREEN;
+    const char *colorStr = cJSON_GetStringValue(cJSON_GetObjectItem(doc, "color"));
+    if (colorStr != nullptr && !parseHexColor(colorStr, color))
     {
-      lastWifiConnected = connected;
-      leds[0] = wifiIndicatorColor();
-      FastLED.show();
+      result = sendError(req, "400 Bad Request", "invalid color");
     }
-    if (connected && !serverStarted)
+    else
     {
-      beginSplash();
-      startServer();
+      bool mirror = cJSON_IsTrue(cJSON_GetObjectItem(doc, "mirror"));
+      LOCK_LEDS();
+      clearLeds();
+      int totalH = measureString(text);
+      int yStart = (kMatrixHeight - totalH) / 2;
+      if (yStart < 0) yStart = 0;
+      int xStart = (kMatrixWidth - DIGIT_HEIGHT) / 2;
+      drawString(text, xStart, yStart, color);
+      if (mirror) applyMirror();
+      splashActive = false;
+      leds[0] = wifiIndicatorColor();
+      show();
+      UNLOCK_LEDS();
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+      result = ESP_OK;
     }
   }
+
+  cJSON_Delete(doc);
+  return result;
+}
+
+static esp_err_t handleNotFound(httpd_req_t *req, httpd_err_code_t err)
+{
+  return sendError(req, "404 Not Found", "not found");
+}
+
+static void startServer()
+{
+  if (httpServer != nullptr) return;
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.stack_size = 8192;       // headroom for cJSON parsing of large frames
+  config.lru_purge_enable = true; // reclaim sockets under load
+  if (httpd_start(&httpServer, &config) != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to start HTTP server");
+    httpServer = nullptr;
+    return;
+  }
+
+  httpd_uri_t root = {"/", HTTP_GET, handleRoot, nullptr};
+  httpd_uri_t docs = {"/docs", HTTP_GET, handleDocs, nullptr};
+  httpd_uri_t update = {"/update", HTTP_POST, handleUpdate, nullptr};
+  httpd_uri_t text = {"/text", HTTP_POST, handleText, nullptr};
+  httpd_register_uri_handler(httpServer, &root);
+  httpd_register_uri_handler(httpServer, &docs);
+  httpd_register_uri_handler(httpServer, &update);
+  httpd_register_uri_handler(httpServer, &text);
+  httpd_register_err_handler(httpServer, HTTPD_404_NOT_FOUND, handleNotFound);
+
+  ESP_LOGI(TAG, "HTTP server listening on port 80 (GET /, GET /docs, POST /update, POST /text)");
+}
+
+// ---------------------------------------------------------------------------
+// WiFi station
+// ---------------------------------------------------------------------------
+
+static void onWifiConnected(const char *ip)
+{
+  gWifiConnected = true;
+  ESP_LOGI(TAG, "Connected. IP: %s", ip);
+  showSplash(ip);
+  splashActive = true;
+  startServer();
+}
+
+static void onWifiDisconnected()
+{
+  bool wasConnected = gWifiConnected;
+  gWifiConnected = false;
+  if (wasConnected)
+  {
+    LOCK_LEDS();
+    leds[0] = wifiIndicatorColor();
+    show();
+    UNLOCK_LEDS();
+  }
+}
+
+static void wifiEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+  if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
+  {
+    esp_wifi_connect();
+  }
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
+  {
+    onWifiDisconnected();
+    esp_wifi_connect(); // keep retrying, like the Arduino auto-reconnect loop
+  }
+  else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
+  {
+    ip_event_got_ip_t *event = static_cast<ip_event_got_ip_t *>(data);
+    char ip[16];
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+    onWifiConnected(ip);
+  }
+}
+
+static void startWifi()
+{
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      WIFI_EVENT, ESP_EVENT_ANY_ID, &wifiEventHandler, nullptr, nullptr));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      IP_EVENT, IP_EVENT_STA_GOT_IP, &wifiEventHandler, nullptr, nullptr));
+
+  wifi_config_t wc = {};
+  strncpy(reinterpret_cast<char *>(wc.sta.ssid), WIFI_SSID, sizeof(wc.sta.ssid) - 1);
+  strncpy(reinterpret_cast<char *>(wc.sta.password), WIFI_PASSWORD, sizeof(wc.sta.password) - 1);
+
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+  ESP_ERROR_CHECK(esp_wifi_start());
+
+  ESP_LOGI(TAG, "Connecting to WiFi '%s'...", WIFI_SSID);
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+static void setupStrip()
+{
+  led_strip_config_t strip_config = {};
+  strip_config.strip_gpio_num = LED_PIN;
+  strip_config.max_leds = NUM_LEDS;
+  strip_config.led_model = LED_MODEL_WS2812;
+  strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+  strip_config.flags.invert_out = false;
+
+  led_strip_rmt_config_t rmt_config = {};
+  rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
+  rmt_config.resolution_hz = 10 * 1000 * 1000;
+  rmt_config.mem_block_symbols = 64;
+  rmt_config.flags.with_dma = false;
+
+  ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &strip));
+  ESP_ERROR_CHECK(led_strip_clear(strip));
+}
+
+extern "C" void app_main(void)
+{
+  // NVS is required by the WiFi stack.
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+  {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
+
+  ledMutex = xSemaphoreCreateRecursiveMutex();
+  setupStrip();
+
+  runStartupTestPattern();
+
+  // Red until associated; the WiFi events drive it green + splash + server.
+  LOCK_LEDS();
+  leds[0] = COLOR_RED;
+  show();
+  UNLOCK_LEDS();
+
+  startWifi();
+  // Setup complete. The WiFi event task and HTTP server task carry on from here.
 }
